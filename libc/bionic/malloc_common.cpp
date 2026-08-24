@@ -377,6 +377,7 @@ static constexpr MallocDispatch __scudo_malloc_dispatch __attribute__((unused)) 
   ScudoMalloc(pvalloc),
 #endif
   ScudoMalloc(realloc),
+  ScudoMalloc(reallocarray),
 #if defined(HAVE_DEPRECATED_MALLOC_FUNCS)
   ScudoMalloc(valloc),
 #endif
