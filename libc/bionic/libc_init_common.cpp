@@ -40,6 +40,7 @@
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/personality.h>
+#include <sys/system_properties.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -205,7 +206,20 @@ extern "C" void scudo_malloc_set_add_large_allocation_slack(int add_slack);
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE void __libc_set_target_sdk_version(int target_api_level __unused) {
 #if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
-  scudo_malloc_set_add_large_allocation_slack(target_api_level < 31);
+  bool add_large_allocation_slack = target_api_level < 31;
+
+  // Some prebuilt camera blobs (notably the MIUI/ArcSoft dual-camera stack)
+  // read a few bytes past the end of large allocations. Scudo only keeps its
+  // compatibility slack for apps targeting Android 11 or older, but the
+  // camera app targets Android 13. Allow a device property to re-enable the
+  // slack without changing the allocator for every other app.
+  char value[PROP_VALUE_MAX] = {};
+  if (__system_property_get("persist.sys.scudo.large_alloc_slack", value) > 0 &&
+      atoi(value) != 0) {
+    add_large_allocation_slack = true;
+  }
+
+  scudo_malloc_set_add_large_allocation_slack(add_large_allocation_slack);
 #endif
 }
 
