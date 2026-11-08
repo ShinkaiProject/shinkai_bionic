@@ -93,6 +93,9 @@ static const PrefixEntry kOverlayDirs[] = {
 };
 
 static const PrefixEntry kRomArtifactPrefixes[] = {
+    PE("com.shinkai."),
+    PE("org.shinkai."),
+    PE("net.pixelos."),
     PE("org.evolution."),
     PE("org.lineageos."),
     PE("org.libremobileos."),
@@ -108,6 +111,7 @@ static const PrefixEntry kRomArtifactPrefixes[] = {
 };
 
 static const PrefixEntry kProcFilterKeywords[] = {
+    PE("shinkai"), PE("Shinkai"), PE("pixelos"), PE("PixelOS"),
     PE("lineage"), PE("Lineage"), PE("evolution"), PE("Evolution"),
     PE("omnirom"), PE("aospa"),
     { nullptr, 0 }
@@ -134,6 +138,7 @@ static const char* const kMountFilterKeywords[] = {
 };
 
 static const char* const kAllowlistedPackages[] = {
+    "net.pixelos.ota",
     "org.lineageos.updater",
     nullptr
 };
@@ -1070,6 +1075,7 @@ static const char* const kVintfFilterPaths[] = {
 };
 
 static const char* const kVintfFilterKeywords[] = {
+    "shinkai", "Shinkai", "pixelos", "PixelOS",
     "lineage", "Lineage", "evolution", "Evolution", nullptr
 };
 #endif
@@ -1121,10 +1127,15 @@ int custom_rom_hide_filter_vintf(const char* path) {
 }
 
 static const char* const kSpoofedEmptyProps[] = {
+    "ro.shinkai.version", "ro.shinkai.build.date", "ro.shinkai.maintainer",
+    "ro.custom.version", "ro.custom.build.date", "ro.custom.device", "ro.custom.fingerprint",
+    "net.shinkai.version", "net.shinkai.build_type", "net.pixelos.version",
     "ro.evolution.version", "ro.evolution.build.version", "ro.evolution.display.version",
-    "ro.lineage.version", "ro.lineage.build.version", "ro.cm.build.version",
-    "ro.modversion", "init.svc_debug_pid.adb_root",
-    "init.svc.adb_root", "service.adb.root", nullptr
+    "ro.lineage.version", "ro.lineage.display.version", "ro.lineage.build.version",
+    "ro.lineage.releasetype", "ro.lineage.device", "ro.lineagelegal.url",
+    "ro.cm.build.version", "ro.modversion",
+    "persist.sys.shinkai_debug_enabled", "persist.sys.pairip.activity.block",
+    "init.svc_debug_pid.adb_root", "init.svc.adb_root", "service.adb.root", nullptr
 };
 
 struct PropOverride { const char* name; const char* value; };
