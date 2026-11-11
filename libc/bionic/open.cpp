@@ -50,6 +50,32 @@ static inline bool needs_mode(int flags) {
   return ((flags & O_CREAT) == O_CREAT) || ((flags & O_TMPFILE) == O_TMPFILE);
 }
 
+static inline bool can_filter_open(int flags) {
+  return (flags & O_ACCMODE) == O_RDONLY &&
+         (flags & (O_CREAT | O_TRUNC | O_TMPFILE | O_PATH | O_DIRECTORY)) == 0;
+}
+
+static int filter_readonly_file(const char* path, int flags) {
+  if (!path || path[0] != '/' || !can_filter_open(flags)) return -1;
+  int fd = custom_rom_hide_filter_proc(path);
+  if (fd < 0) fd = custom_rom_hide_filter_vintf(path);
+  if (fd < 0) fd = custom_rom_hide_filter_sepolicy(path);
+  // O_NOFOLLOW only concerns the last component: regular files such as /proc/cmdline are
+  // substituted as usual, while a symlink such as /proc/mounts must still fail with ELOOP.
+  if (fd >= 0 && (flags & O_NOFOLLOW) && custom_rom_hide_is_symlink(path)) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static inline int finish_filtered(int filtered_fd, int flags) {
+  if (filtered_fd >= 0 && (flags & O_CLOEXEC)) {
+    fcntl(filtered_fd, F_SETFD, FD_CLOEXEC);
+  }
+  return filtered_fd;
+}
+
 int creat(const char* pathname, mode_t mode) {
   return open(pathname, O_CREAT | O_TRUNC | O_WRONLY, mode);
 }
@@ -65,10 +91,8 @@ int open(const char* pathname, int flags, ...) {
     va_end(args);
   }
 
-  int filtered_fd = custom_rom_hide_filter_proc(pathname);
-  if (filtered_fd >= 0) return FDTRACK_CREATE(filtered_fd);
-  filtered_fd = custom_rom_hide_filter_sepolicy(pathname);
-  if (filtered_fd >= 0) return FDTRACK_CREATE(filtered_fd);
+  int filtered_fd = filter_readonly_file(pathname, flags);
+  if (filtered_fd >= 0) return FDTRACK_CREATE(finish_filtered(filtered_fd, flags));
 
   if (custom_rom_hide_should_block(pathname)) {
     errno = ENOENT;
@@ -81,10 +105,8 @@ __strong_alias(open64, open);
 
 int __open_2(const char* pathname, int flags) {
   if (needs_mode(flags)) __fortify_fatal("open: called with O_CREAT/O_TMPFILE but no mode");
-  int filtered_fd = custom_rom_hide_filter_proc(pathname);
-  if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("open", filtered_fd);
-  filtered_fd = custom_rom_hide_filter_sepolicy(pathname);
-  if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("open", filtered_fd);
+  int filtered_fd = filter_readonly_file(pathname, flags);
+  if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("open", finish_filtered(filtered_fd, flags));
   if (custom_rom_hide_should_block(pathname)) {
     errno = ENOENT;
     return -1;
@@ -102,12 +124,8 @@ int openat(int fd, const char *pathname, int flags, ...) {
     va_end(args);
   }
 
-  if (fd == AT_FDCWD && pathname && pathname[0] == '/') {
-    int filtered_fd = custom_rom_hide_filter_proc(pathname);
-    if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("openat", filtered_fd);
-    filtered_fd = custom_rom_hide_filter_sepolicy(pathname);
-    if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("openat", filtered_fd);
-  }
+  int filtered_fd = filter_readonly_file(pathname, flags);
+  if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("openat", finish_filtered(filtered_fd, flags));
 
   if (custom_rom_hide_should_block_at(fd, pathname)) {
     errno = ENOENT;
@@ -120,12 +138,8 @@ __strong_alias(openat64, openat);
 
 int __openat_2(int fd, const char* pathname, int flags) {
   if (needs_mode(flags)) __fortify_fatal("open: called with O_CREAT/O_TMPFILE but no mode");
-  if (fd == AT_FDCWD && pathname && pathname[0] == '/') {
-    int filtered_fd = custom_rom_hide_filter_proc(pathname);
-    if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("openat", filtered_fd);
-    filtered_fd = custom_rom_hide_filter_sepolicy(pathname);
-    if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("openat", filtered_fd);
-  }
+  int filtered_fd = filter_readonly_file(pathname, flags);
+  if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("openat", finish_filtered(filtered_fd, flags));
   if (custom_rom_hide_should_block_at(fd, pathname)) {
     errno = ENOENT;
     return -1;
