@@ -450,6 +450,14 @@ const MallocDispatch* NativeAllocatorDispatch() {
 #endif
 }
 
+bool is_using_scudo() {
+#if defined(BOTH_JEMALLOC_AND_SCUDO)
+  return native_allocator_dispatch == &__scudo_malloc_dispatch;
+#else
+  return false;
+#endif
+}
+
 #if !defined(LIBC_STATIC)
 void MallocInitImpl(libc_globals* globals);
 #endif

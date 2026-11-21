@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include "bionic/pthread_internal.h"
 #include "libc_init_common.h"
+#include "native_allocator.h"
 
 #include "private/bionic_elf_tls.h"
 #include "private/bionic_globals.h"
@@ -96,6 +97,9 @@ static void __libc_preinit_impl() {
 
   __libc_init_globals();
   __libc_init_common();
+#if defined(BOTH_JEMALLOC_AND_SCUDO)
+  __libc_globals.mutate(InitNativeAllocatorDispatch);
+#endif
   __libc_init_scudo();
 
 #if __has_feature(hwaddress_sanitizer)

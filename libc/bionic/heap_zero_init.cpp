@@ -27,13 +27,16 @@
  */
 
 #include "heap_zero_init.h"
+#include "native_allocator.h"
 
 extern "C" void scudo_malloc_set_zero_contents(int zero_contents);
 
 bool SetHeapZeroInitialize(bool zero_init __attribute__((__unused__))) {
-#ifdef USE_SCUDO
-  scudo_malloc_set_zero_contents(zero_init);
-  return true;
+#if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+  if (is_using_scudo()) {
+    scudo_malloc_set_zero_contents(zero_init);
+    return true;
+  }
 #endif
   return false;
 }

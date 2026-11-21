@@ -384,18 +384,16 @@ void MallocInitImpl(libc_globals* globals) {
   char prop[PROP_VALUE_MAX];
   char* options = prop;
 
-#if defined(BOTH_JEMALLOC_AND_SCUDO)
-  InitNativeAllocatorDispatch(globals);
-#endif
-
   MaybeInitGwpAsanFromLibc(globals);
 
 #if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
-  __libc_shared_globals()->scudo_stack_depot = __scudo_get_stack_depot_addr();
-  __libc_shared_globals()->scudo_region_info = __scudo_get_region_info_addr();
-  __libc_shared_globals()->scudo_ring_buffer = __scudo_get_ring_buffer_addr();
-  __libc_shared_globals()->scudo_ring_buffer_size = __scudo_get_ring_buffer_size();
-  __libc_shared_globals()->scudo_stack_depot_size = __scudo_get_stack_depot_size();
+  if (is_using_scudo()) {
+    __libc_shared_globals()->scudo_stack_depot = __scudo_get_stack_depot_addr();
+    __libc_shared_globals()->scudo_region_info = __scudo_get_region_info_addr();
+    __libc_shared_globals()->scudo_ring_buffer = __scudo_get_ring_buffer_addr();
+    __libc_shared_globals()->scudo_ring_buffer_size = __scudo_get_ring_buffer_size();
+    __libc_shared_globals()->scudo_stack_depot_size = __scudo_get_stack_depot_size();
+  }
 #endif
 
   // Prefer malloc debug since it existed first and is a more complete

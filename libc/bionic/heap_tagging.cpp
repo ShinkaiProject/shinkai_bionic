@@ -74,6 +74,7 @@ void SetDefaultHeapTaggingLevel() {
   });
 
 #if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+  if (!is_using_scudo()) return;
   switch (heap_tagging_level) {
     case M_HEAP_TAGGING_LEVEL_TBI:
     case M_HEAP_TAGGING_LEVEL_NONE:
@@ -133,7 +134,7 @@ bool SetHeapTaggingLevel(HeapTaggingLevel tag_level) {
         }
       }
 #if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
-      scudo_malloc_disable_memory_tagging();
+      if (is_using_scudo()) scudo_malloc_disable_memory_tagging();
 #endif
       break;
     case M_HEAP_TAGGING_LEVEL_TBI:
@@ -161,16 +162,18 @@ bool SetHeapTaggingLevel(HeapTaggingLevel tag_level) {
           set_tcf_on_all_threads(PR_MTE_TCF_ASYNC);
         }
 #if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
-        scudo_malloc_set_track_allocation_stacks(0);
+        if (is_using_scudo()) scudo_malloc_set_track_allocation_stacks(0);
 #endif
       } else if (tag_level == M_HEAP_TAGGING_LEVEL_SYNC) {
         set_tcf_on_all_threads(PR_MTE_TCF_SYNC);
 #if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
-        scudo_malloc_set_track_allocation_stacks(1);
-        __libc_shared_globals()->scudo_ring_buffer = __scudo_get_ring_buffer_addr();
-        __libc_shared_globals()->scudo_ring_buffer_size = __scudo_get_ring_buffer_size();
-        __libc_shared_globals()->scudo_stack_depot = __scudo_get_stack_depot_addr();
-        __libc_shared_globals()->scudo_stack_depot_size = __scudo_get_stack_depot_size();
+        if (is_using_scudo()) {
+          scudo_malloc_set_track_allocation_stacks(1);
+          __libc_shared_globals()->scudo_ring_buffer = __scudo_get_ring_buffer_addr();
+          __libc_shared_globals()->scudo_ring_buffer_size = __scudo_get_ring_buffer_size();
+          __libc_shared_globals()->scudo_stack_depot = __scudo_get_stack_depot_addr();
+          __libc_shared_globals()->scudo_stack_depot_size = __scudo_get_stack_depot_size();
+        }
 #endif
       }
       break;

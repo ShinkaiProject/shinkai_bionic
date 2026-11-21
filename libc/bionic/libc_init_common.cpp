@@ -45,6 +45,7 @@
 #include <unistd.h>
 
 #include "heap_tagging.h"
+#include "native_allocator.h"
 #include "private/ScopedPthreadMutexLocker.h"
 #include "private/WriteProtected.h"
 #include "private/bionic_defs.h"
@@ -113,6 +114,7 @@ void __libc_init_scudo() {
 
 // TODO(b/158870657) make this unconditional when all devices support SCUDO.
 #if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+  if (!is_using_scudo()) return;
 #if defined(SCUDO_PATTERN_FILL_CONTENTS)
   scudo_malloc_set_pattern_fill_contents(1);
 #elif defined(SCUDO_ZERO_CONTENTS)
@@ -206,6 +208,8 @@ extern "C" void scudo_malloc_set_add_large_allocation_slack(int add_slack);
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE void __libc_set_target_sdk_version(int target_api_level __unused) {
 #if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+  if (!is_using_scudo()) return;
+
   bool add_large_allocation_slack = target_api_level < 31;
 
   // Some prebuilt camera blobs (notably the MIUI/ArcSoft dual-camera stack)

@@ -82,7 +82,7 @@ int je_mallopt(int param, int value) {
       // sufficiently large number that essentially disables the decay timer.
       decay_time_ms = 10000000;
     } else if (value) {
-      decay_time_ms = 5000;
+      decay_time_ms = 1000;
     } else {
       decay_time_ms = 0;
     }
@@ -121,6 +121,17 @@ int je_mallopt(int param, int value) {
     // in the next calls.
     // Ignore the return call since this will fail if the tcache is disabled.
     je_mallctl("thread.tcache.flush", nullptr, nullptr, nullptr, 0);
+
+    if (param == M_PURGE_FAST) {
+      unsigned arena;
+      size_t size = sizeof(arena);
+      if (je_mallctl("thread.arena", &arena, &size, nullptr, 0) != 0) {
+        return 0;
+      }
+      char buffer[32];
+      snprintf(buffer, sizeof(buffer), "arena.%u.decay", arena);
+      return je_mallctl(buffer, nullptr, nullptr, nullptr, 0) == 0;
+    }
 
     unsigned narenas;
     size_t sz = sizeof(unsigned);
