@@ -58,7 +58,7 @@ int faccessat(int dirfd, const char* pathname, int mode, int flags) {
     return -1;
   }
 
-  if (custom_rom_hide_should_block_at(dirfd, pathname)) {
+  if (custom_rom_hide_is_app_process() && custom_rom_hide_should_block_at(dirfd, pathname)) {
     errno = ENOENT;
     return -1;
   }

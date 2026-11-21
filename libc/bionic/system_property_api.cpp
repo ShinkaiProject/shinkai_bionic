@@ -69,7 +69,7 @@ uint32_t __system_property_area_serial() {
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 const prop_info* __system_property_find(const char* name) {
-  if (custom_rom_hide_should_hide_prop(name)) {
+  if (custom_rom_hide_is_app_process() && custom_rom_hide_should_hide_prop(name)) {
     return nullptr;
   }
   return system_properties.Find(name);
@@ -79,7 +79,8 @@ __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 int __system_property_read(const prop_info* pi, char* name, char* value) {
   int len = system_properties.Read(pi, name, value);
   const char* prop_name = name ? name : (pi ? pi->name : nullptr);
-  if (prop_name && custom_rom_hide_should_spoof_prop(prop_name, value)) {
+  if (prop_name && custom_rom_hide_is_app_process() &&
+      custom_rom_hide_should_spoof_prop(prop_name, value)) {
     return strlen(value);
   }
   return len;
@@ -93,11 +94,6 @@ struct ReadCallbackOverrideCtx {
 static void read_callback_intercept(void* cookie, const char* name, const char* value,
                                     uint32_t serial) {
     auto* ctx = static_cast<ReadCallbackOverrideCtx*>(cookie);
-
-    if (!custom_rom_hide_is_app_process()) {
-        ctx->original_callback(ctx->original_cookie, name, value, serial);
-        return;
-    }
 
     bool is_ro = (strncmp(name, "ro.", 3) == 0);
 
@@ -129,6 +125,9 @@ void __system_property_read_callback(const prop_info* pi,
                                      void (*callback)(void* cookie, const char* name,
                                                       const char* value, uint32_t serial),
                                      void* cookie) {
+  if (!custom_rom_hide_is_app_process()) {
+    return system_properties.ReadCallback(pi, callback, cookie);
+  }
   ReadCallbackOverrideCtx ctx{callback, cookie};
   return system_properties.ReadCallback(pi, read_callback_intercept, &ctx);
 }
@@ -136,7 +135,7 @@ void __system_property_read_callback(const prop_info* pi,
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 int __system_property_get(const char* name, char* value) {
   int len = system_properties.Get(name, value);
-  if (custom_rom_hide_should_spoof_prop(name, value)) {
+  if (custom_rom_hide_is_app_process() && custom_rom_hide_should_spoof_prop(name, value)) {
     return strlen(value);
   }
   return len;
@@ -230,6 +229,9 @@ static void foreach_callback_intercept(const prop_info* pi, void* cookie) {
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 int __system_property_foreach(void (*propfn)(const prop_info* pi, void* cookie), void* cookie) {
     if (!propfn) return -1;
+    if (!custom_rom_hide_is_app_process()) {
+        return system_properties.Foreach(propfn, cookie);
+    }
     ForeachOverrideCtx ctx{propfn, cookie};
     return system_properties.Foreach(foreach_callback_intercept, &ctx);
 }

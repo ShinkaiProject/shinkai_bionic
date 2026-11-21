@@ -117,6 +117,7 @@ static bool __fill_DIR(DIR* d) {
 }
 
 static dirent* __readdir_locked(DIR* d) {
+  bool is_app = custom_rom_hide_is_app_process();
   while (true) {
     if (d->available_bytes_ == 0 && !__fill_DIR(d)) {
       return nullptr;
@@ -129,7 +130,7 @@ static dirent* __readdir_locked(DIR* d) {
     // so the value range of long type is enough.
     d->current_pos_ = static_cast<long>(entry->d_off);
 
-    if (!custom_rom_hide_should_filter_dirent(d->fd_, entry->d_name)) {
+    if (!is_app || !custom_rom_hide_should_filter_dirent(d->fd_, entry->d_name)) {
       return entry;
     }
   }

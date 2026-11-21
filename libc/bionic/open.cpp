@@ -56,7 +56,8 @@ static inline bool can_filter_open(int flags) {
 }
 
 static int filter_readonly_file(const char* path, int flags) {
-  if (!path || path[0] != '/' || !can_filter_open(flags)) return -1;
+  if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000 ||
+      path[0] != '/' || !can_filter_open(flags)) return -1;
   int fd = custom_rom_hide_filter_proc(path);
   if (fd < 0) fd = custom_rom_hide_filter_vintf(path);
   if (fd < 0) fd = custom_rom_hide_filter_sepolicy(path);
@@ -69,11 +70,19 @@ static int filter_readonly_file(const char* path, int flags) {
   return fd;
 }
 
-static inline int finish_filtered(int filtered_fd, int flags) {
-  if (filtered_fd >= 0 && (flags & O_CLOEXEC)) {
-    fcntl(filtered_fd, F_SETFD, FD_CLOEXEC);
+static int open_impl(int dirfd, const char* path, int flags, mode_t mode) {
+  if (custom_rom_hide_is_app_process()) {
+    int filtered_fd = filter_readonly_file(path, flags);
+    if (filtered_fd >= 0) {
+      if (flags & O_CLOEXEC) fcntl(filtered_fd, F_SETFD, FD_CLOEXEC);
+      return filtered_fd;
+    }
+    if (custom_rom_hide_should_block_at(dirfd, path)) {
+      errno = ENOENT;
+      return -1;
+    }
   }
-  return filtered_fd;
+  return __openat(dirfd, path, force_O_LARGEFILE(flags), mode);
 }
 
 int creat(const char* pathname, mode_t mode) {
@@ -91,27 +100,13 @@ int open(const char* pathname, int flags, ...) {
     va_end(args);
   }
 
-  int filtered_fd = filter_readonly_file(pathname, flags);
-  if (filtered_fd >= 0) return FDTRACK_CREATE(finish_filtered(filtered_fd, flags));
-
-  if (custom_rom_hide_should_block(pathname)) {
-    errno = ENOENT;
-    return -1;
-  }
-
-  return FDTRACK_CREATE(__openat(AT_FDCWD, pathname, force_O_LARGEFILE(flags), mode));
+  return FDTRACK_CREATE(open_impl(AT_FDCWD, pathname, flags, mode));
 }
 __strong_alias(open64, open);
 
 int __open_2(const char* pathname, int flags) {
   if (needs_mode(flags)) __fortify_fatal("open: called with O_CREAT/O_TMPFILE but no mode");
-  int filtered_fd = filter_readonly_file(pathname, flags);
-  if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("open", finish_filtered(filtered_fd, flags));
-  if (custom_rom_hide_should_block(pathname)) {
-    errno = ENOENT;
-    return -1;
-  }
-  return FDTRACK_CREATE_NAME("open", __openat(AT_FDCWD, pathname, force_O_LARGEFILE(flags), 0));
+  return FDTRACK_CREATE_NAME("open", open_impl(AT_FDCWD, pathname, flags, 0));
 }
 
 int openat(int fd, const char *pathname, int flags, ...) {
@@ -124,25 +119,11 @@ int openat(int fd, const char *pathname, int flags, ...) {
     va_end(args);
   }
 
-  int filtered_fd = filter_readonly_file(pathname, flags);
-  if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("openat", finish_filtered(filtered_fd, flags));
-
-  if (custom_rom_hide_should_block_at(fd, pathname)) {
-    errno = ENOENT;
-    return -1;
-  }
-
-  return FDTRACK_CREATE_NAME("openat", __openat(fd, pathname, force_O_LARGEFILE(flags), mode));
+  return FDTRACK_CREATE_NAME("openat", open_impl(fd, pathname, flags, mode));
 }
 __strong_alias(openat64, openat);
 
 int __openat_2(int fd, const char* pathname, int flags) {
   if (needs_mode(flags)) __fortify_fatal("open: called with O_CREAT/O_TMPFILE but no mode");
-  int filtered_fd = filter_readonly_file(pathname, flags);
-  if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("openat", finish_filtered(filtered_fd, flags));
-  if (custom_rom_hide_should_block_at(fd, pathname)) {
-    errno = ENOENT;
-    return -1;
-  }
-  return FDTRACK_CREATE_NAME("openat", __openat(fd, pathname, force_O_LARGEFILE(flags), 0));
+  return FDTRACK_CREATE_NAME("openat", open_impl(fd, pathname, flags, 0));
 }

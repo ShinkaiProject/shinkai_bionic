@@ -57,7 +57,7 @@ int fstat(int fd, struct stat* sb) {
 #else
   int res = __fstat64(fd, sb);
 #endif
-  if (res == 0) {
+  if (res == 0 && custom_rom_hide_is_app_process()) {
     custom_rom_hide_spoof_fd_stat(fd, sb);
   }
   return res;
@@ -65,12 +65,13 @@ int fstat(int fd, struct stat* sb) {
 __strong_alias(fstat64, fstat);
 
 int fstatat(int dirfd, const char* path, struct stat* sb, int flags) {
-  if (custom_rom_hide_should_block_at(dirfd, path)) {
+  bool is_app = custom_rom_hide_is_app_process();
+  if (is_app && custom_rom_hide_should_block_at(dirfd, path)) {
     errno = ENOENT;
     return -1;
   }
   int res = raw_fstatat(dirfd, path, sb, flags);
-  if (res == 0) {
+  if (res == 0 && is_app) {
     if ((flags & AT_EMPTY_PATH) && (path == nullptr || path[0] == '\0')) {
       custom_rom_hide_spoof_fd_stat(dirfd, sb);
     } else {
@@ -82,12 +83,13 @@ int fstatat(int dirfd, const char* path, struct stat* sb, int flags) {
 __strong_alias(fstatat64, fstatat);
 
 int stat(const char* path, struct stat* sb) {
-  if (custom_rom_hide_should_block(path)) {
+  bool is_app = custom_rom_hide_is_app_process();
+  if (is_app && custom_rom_hide_should_block(path)) {
     errno = ENOENT;
     return -1;
   }
   int res = raw_fstatat(AT_FDCWD, path, sb, 0);
-  if (res == 0) {
+  if (res == 0 && is_app) {
     custom_rom_hide_spoof_stat(path, sb);
   }
   return res;
@@ -95,12 +97,13 @@ int stat(const char* path, struct stat* sb) {
 __strong_alias(stat64, stat);
 
 int statx(int dirfd, const char* path, int flags, unsigned mask, struct statx* buf) {
-  if (custom_rom_hide_should_block_at(dirfd, path)) {
+  bool is_app = custom_rom_hide_is_app_process();
+  if (is_app && custom_rom_hide_should_block_at(dirfd, path)) {
     errno = ENOENT;
     return -1;
   }
   int res = __statx(dirfd, path, flags, mask, buf);
-  if (res == 0) {
+  if (res == 0 && is_app) {
     if ((flags & AT_EMPTY_PATH) && (path == nullptr || path[0] == '\0')) {
       custom_rom_hide_spoof_fd_statx(dirfd, mask, buf);
     } else {

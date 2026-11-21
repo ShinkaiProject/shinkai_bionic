@@ -39,19 +39,16 @@
 extern "C" ssize_t __readlinkat(int, const char*, char*, size_t);
 
 ssize_t readlink(const char* path, char* buf, size_t size) {
-  if (custom_rom_hide_should_block(path)) {
-    errno = ENOENT;
-    return -1;
-  }
   return readlinkat(AT_FDCWD, path, buf, size);
 }
 
 ssize_t readlinkat(int dirfd, const char* path, char* buf, size_t size) {
-  if (custom_rom_hide_should_block_at(dirfd, path)) {
+  bool is_app = custom_rom_hide_is_app_process();
+  if (is_app && custom_rom_hide_should_block_at(dirfd, path)) {
     errno = ENOENT;
     return -1;
   }
 
   ssize_t ret = __readlinkat(dirfd, path, buf, size);
-  return custom_rom_hide_readlinkat_post(dirfd, path, buf, size, ret);
+  return is_app ? custom_rom_hide_readlinkat_post(dirfd, path, buf, size, ret) : ret;
 }

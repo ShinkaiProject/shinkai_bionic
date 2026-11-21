@@ -27,6 +27,8 @@ struct statx;
 
 __BEGIN_DECLS
 
+// Classify once per libc operation before invoking the pathname or property hooks.
+// FD lifetime tracking applies independently of the calling thread's UID.
 bool custom_rom_hide_is_app_process();
 
 bool custom_rom_hide_should_block(const char* path);

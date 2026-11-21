@@ -42,14 +42,15 @@ int fstatfs(int fd, struct statfs* result) {
   if (rc != 0) {
     return rc;
   }
-  custom_rom_hide_spoof_fd_statfs(fd, result);
+  if (custom_rom_hide_is_app_process()) custom_rom_hide_spoof_fd_statfs(fd, result);
   result->f_flags &= ~ST_VALID;
   return 0;
 }
 __strong_alias(fstatfs64, fstatfs);
 
 int statfs(const char* path, struct statfs* result) {
-  if (custom_rom_hide_should_block(path)) {
+  bool is_app = custom_rom_hide_is_app_process();
+  if (is_app && custom_rom_hide_should_block(path)) {
     errno = ENOENT;
     return -1;
   }
@@ -57,7 +58,7 @@ int statfs(const char* path, struct statfs* result) {
   if (rc != 0) {
     return rc;
   }
-  custom_rom_hide_spoof_statfs(path, result);
+  if (is_app) custom_rom_hide_spoof_statfs(path, result);
   result->f_flags &= ~ST_VALID;
   return 0;
 }

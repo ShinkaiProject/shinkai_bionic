@@ -20,6 +20,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/magic.h>
 #include <linux/memfd.h>
 #include <linux/stat.h>
@@ -41,9 +42,6 @@
 #define HIDE_MEMFD_NAME_PREFIX HIDE_MEMFD_TAG ":"
 #define HIDE_MEMFD_LINK_PREFIX "/memfd:" HIDE_MEMFD_TAG ":"
 #define HIDE_MEMFD_LINK_PREFIX_LEN (sizeof(HIDE_MEMFD_LINK_PREFIX) - 1)
-#define HIDE_TRACKED_FD_LIMIT 32768
-#define HIDE_TRACKED_FD_WORD_BITS 64
-#define HIDE_TRACKED_FD_WORD_COUNT (HIDE_TRACKED_FD_LIMIT / HIDE_TRACKED_FD_WORD_BITS)
 
 #ifndef OVERLAYFS_SUPER_MAGIC
 #define OVERLAYFS_SUPER_MAGIC 0x794c7630
@@ -159,37 +157,9 @@ static const PartitionDevEntry kPartitionDmMap[] = {
     { nullptr,       0 },
 };
 
-static _Atomic(uint64_t) g_substituted_fd_bits[HIDE_TRACKED_FD_WORD_COUNT];
-
-static bool is_trackable_fd(int fd) {
-    return fd >= 0 && fd < HIDE_TRACKED_FD_LIMIT;
-}
-
-static bool is_tracked_fd(int fd) {
-    if (!is_trackable_fd(fd)) return false;
-    uint64_t bit = 1ULL << (fd % HIDE_TRACKED_FD_WORD_BITS);
-    uint64_t word = atomic_load_explicit(&g_substituted_fd_bits[fd / HIDE_TRACKED_FD_WORD_BITS],
-                                         memory_order_acquire);
-    return (word & bit) != 0;
-}
-
-static void register_fd(int fd) {
-    if (!is_trackable_fd(fd)) return;
-    uint64_t bit = 1ULL << (fd % HIDE_TRACKED_FD_WORD_BITS);
-    atomic_fetch_or_explicit(&g_substituted_fd_bits[fd / HIDE_TRACKED_FD_WORD_BITS], bit,
-                             memory_order_release);
-}
-
 // Metadata of the real file, captured when the substitution is created while the
 // canonical path still resolves. It is the fallback for fstat/statx once that path
-// no longer resolves — a file opened through /proc/thread-self by a thread that has
-// exited, or a substituted file of another process that has gone. Indexed by fd,
-// parallel to g_substituted_fd_bits.
-//
-// g_fd_meta_lock guards both the pointers and the lifetime of the records: a reader
-// copies the record out under the lock, so a concurrent store/clear that frees the
-// old record (e.g. dup2 over an fd another thread is stat-ing) cannot free it while
-// the reader still dereferences it.
+// no longer resolves, for example after a thread supplying /proc/thread-self exits.
 struct FdMeta {
     struct stat sb;
     struct statx sx;
@@ -200,7 +170,28 @@ struct FdMeta {
 static constexpr unsigned kStatxCaptureMask = STATX_ALL | STATX_DIOALIGN |
         STATX_MNT_ID_UNIQUE | STATX_SUBVOL | STATX_WRITE_ATOMIC | STATX_DIO_READ_ALIGN;
 
-static FdMeta* g_fd_meta[HIDE_TRACKED_FD_LIMIT];
+// Sparse pages cover the full nonnegative int range without allocating a
+// descriptor-sized table in every process. Pages stay alive once published so
+// ordinary close and fstat can test an untracked descriptor without locking.
+static constexpr unsigned kFdPageBits = 8;
+static constexpr unsigned kFdPageSize = 1u << kFdPageBits;
+static constexpr unsigned kFdPageMask = kFdPageSize - 1;
+static constexpr unsigned kFdWordBits = 64;
+
+struct FdPage {
+    _Atomic(uint64_t) tracked[kFdPageSize / kFdWordBits];
+    FdMeta* metadata[kFdPageSize];  // Guarded by g_fd_meta_lock.
+};
+
+struct FdPageTable {
+    _Atomic(FdPage*) pages[kFdPageSize];
+};
+
+struct FdDirectory {
+    _Atomic(FdPageTable*) tables[kFdPageSize];
+};
+
+static _Atomic(FdDirectory*) g_fd_directories[128];
 static Lock g_fd_meta_lock;
 static pthread_once_t g_fd_meta_atfork_once = PTHREAD_ONCE_INIT;
 
@@ -212,56 +203,92 @@ static void register_fd_meta_atfork() {
     pthread_atfork(prepare_fd_meta_fork, parent_fd_meta_fork, child_fd_meta_fork);
 }
 
-static void clear_fd_meta(int fd) {
-    if (!is_trackable_fd(fd)) return;
-    g_fd_meta_lock.lock();
-    FdMeta* prev = g_fd_meta[fd];
-    g_fd_meta[fd] = nullptr;
-    g_fd_meta_lock.unlock();
-    free(prev);
+template <typename T>
+static T* get_fd_table(_Atomic(T*)* slot, bool create) {
+    T* table = atomic_load_explicit(slot, memory_order_acquire);
+    if (table || !create) return table;
+
+    T* fresh = static_cast<T*>(calloc(1, sizeof(T)));
+    if (!fresh) return nullptr;
+    if (atomic_compare_exchange_strong_explicit(slot, &table, fresh, memory_order_acq_rel,
+                                                memory_order_acquire)) {
+        return fresh;
+    }
+    free(fresh);
+    return table;
 }
 
-static void store_fd_meta(int fd, const FdMeta* meta) {
-    if (!is_trackable_fd(fd)) return;
-    FdMeta* copy = static_cast<FdMeta*>(malloc(sizeof(FdMeta)));
-    if (!copy) {
-        clear_fd_meta(fd);
+static FdPage* get_fd_page(int fd, bool create = false) {
+    if (fd < 0) return nullptr;
+    unsigned index = static_cast<unsigned>(fd);
+    auto* directory = get_fd_table<FdDirectory>(&g_fd_directories[index >> (kFdPageBits * 3)], create);
+    if (!directory) return nullptr;
+    auto* table = get_fd_table<FdPageTable>(&directory->tables[(index >> (kFdPageBits * 2)) & kFdPageMask],
+                               create);
+    if (!table) return nullptr;
+    return get_fd_table<FdPage>(&table->pages[(index >> kFdPageBits) & kFdPageMask], create);
+}
+
+static bool is_tracked_fd(int fd) {
+    FdPage* page = get_fd_page(fd);
+    if (!page) return false;
+    unsigned index = static_cast<unsigned>(fd) & kFdPageMask;
+    uint64_t bit = 1ULL << (index % kFdWordBits);
+    return (atomic_load_explicit(&page->tracked[index / kFdWordBits], memory_order_acquire)
+            & bit) != 0;
+}
+
+static void set_fd_tracking(int fd, bool tracked, const FdMeta* meta = nullptr) {
+    if (!tracked && !is_tracked_fd(fd)) return;
+    int saved_errno = errno;
+    FdPage* page = get_fd_page(fd, tracked);
+    if (!page) {
+        errno = saved_errno;
         return;
     }
-    *copy = *meta;
+
+    FdMeta* copy = nullptr;
+    if (meta) {
+        copy = static_cast<FdMeta*>(malloc(sizeof(FdMeta)));
+        if (copy) *copy = *meta;
+    }
+    unsigned index = static_cast<unsigned>(fd) & kFdPageMask;
+    uint64_t bit = 1ULL << (index % kFdWordBits);
+    auto* word = &page->tracked[index / kFdWordBits];
+
     g_fd_meta_lock.lock();
-    FdMeta* prev = g_fd_meta[fd];
-    g_fd_meta[fd] = copy;
+    FdMeta* old = page->metadata[index];
+    page->metadata[index] = copy;
+    if (tracked) {
+        atomic_fetch_or_explicit(word, bit, memory_order_release);
+    } else {
+        atomic_fetch_and_explicit(word, ~bit, memory_order_release);
+    }
     g_fd_meta_lock.unlock();
-    free(prev);
+    free(old);
+    errno = saved_errno;
 }
 
 static bool load_fd_meta(int fd, FdMeta* out) {
-    if (!is_trackable_fd(fd)) return false;
-    bool ok = false;
+    FdPage* page = get_fd_page(fd);
+    if (!page) return false;
+    unsigned index = static_cast<unsigned>(fd) & kFdPageMask;
     g_fd_meta_lock.lock();
-    if (g_fd_meta[fd]) { *out = *g_fd_meta[fd]; ok = true; }
+    const FdMeta* meta = page->metadata[index];
+    if (meta) *out = *meta;
     g_fd_meta_lock.unlock();
-    return ok;
+    return meta != nullptr;
 }
 
 void custom_rom_hide_unregister_fd(int fd) {
-    if (!is_trackable_fd(fd)) return;
-    uint64_t bit = 1ULL << (fd % HIDE_TRACKED_FD_WORD_BITS);
-    _Atomic(uint64_t)* word = &g_substituted_fd_bits[fd / HIDE_TRACKED_FD_WORD_BITS];
-    // close() routes here for every fd; an untracked one must not touch the meta lock.
-    if ((atomic_load_explicit(word, memory_order_acquire) & bit) == 0) return;
-    atomic_fetch_and_explicit(word, ~bit, memory_order_release);
-    clear_fd_meta(fd);
+    set_fd_tracking(fd, false);
 }
 
 void custom_rom_hide_transfer_fd(int old_fd, int new_fd) {
     if (new_fd < 0 || old_fd == new_fd) return;
     if (is_tracked_fd(old_fd)) {
         FdMeta meta;
-        if (load_fd_meta(old_fd, &meta)) store_fd_meta(new_fd, &meta);
-        else clear_fd_meta(new_fd);
-        register_fd(new_fd);
+        set_fd_tracking(new_fd, true, load_fd_meta(old_fd, &meta) ? &meta : nullptr);
     } else {
         custom_rom_hide_unregister_fd(new_fd);
     }
@@ -317,7 +344,7 @@ static inline int raw_statfs(const char* path, struct statfs* sf) {
 
 static bool read_cmdline_name(char* out, size_t out_size) {
     if (out_size == 0) return false;
-    int fd = raw_openat("/proc/self/cmdline", O_RDONLY);
+    int fd = raw_openat("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;
 
     ssize_t n = raw_read(fd, out, out_size - 1);
@@ -338,6 +365,7 @@ static bool name_is_zygote(const char* name) {
     if (len >= slen && strcmp(name + len - slen, kZygoteSuffix) == 0) return true;
     if (strcmp(name, "zygote") == 0 || strcmp(name, "zygote64") == 0) return true;
     if (strcmp(name, "usap32") == 0 || strcmp(name, "usap64") == 0) return true;
+    if (strcmp(name, "<pre-initialized>") == 0) return true;
     return false;
 }
 
@@ -358,27 +386,49 @@ static bool compute_exempt(bool* is_zygote) {
     return false;
 }
 
+static constexpr uint64_t kPidCacheValidBit = 2ULL;
+static constexpr uint64_t kPidCacheValueBit = 1ULL;
+
+static inline uint64_t pack_pid_bool_cache(pid_t pid, bool value) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(pid)) << 2) |
+           kPidCacheValidBit | (value ? kPidCacheValueBit : 0ULL);
+}
+
+static inline bool unpack_pid_bool_cache(uint64_t word, pid_t cur, bool* out) {
+    if ((word & kPidCacheValidBit) == 0 ||
+        static_cast<pid_t>(static_cast<uint32_t>(word >> 2)) != cur) {
+        return false;
+    }
+    *out = (word & kPidCacheValueBit) != 0;
+    return true;
+}
+
 static bool is_exempt_process() {
-    static _Atomic(pid_t) cached_pid = -1;
-    static _Atomic(bool) cached_value = false;
+    static _Atomic(uint64_t) cached_state = 0;
     pid_t cur = getpid();
-    if (atomic_load_explicit(&cached_pid, memory_order_acquire) == cur) {
-        return atomic_load_explicit(&cached_value, memory_order_relaxed);
+    bool cached_value = false;
+    if (unpack_pid_bool_cache(atomic_load_explicit(&cached_state, memory_order_acquire),
+                              cur, &cached_value)) {
+        return cached_value;
     }
 
     bool is_zygote = false;
     bool result = compute_exempt(&is_zygote);
     if (!is_zygote) {
-        atomic_store_explicit(&cached_value, result, memory_order_relaxed);
-        atomic_store_explicit(&cached_pid, cur, memory_order_release);
+        atomic_store_explicit(&cached_state, pack_pid_bool_cache(cur, result),
+                              memory_order_release);
     }
     return result;
 }
 
-static bool is_app_process() {
+bool custom_rom_hide_is_app_process() {
+    // Read the calling thread's live real UID once per libc operation. Raw setuid
+    // syscalls can change it without passing through a libc invalidation hook.
     if ((getuid() % AID_USER_OFFSET) < AID_APP_START) return false;
-    if (is_exempt_process()) return false;
-    return true;
+    const int saved_errno = errno;
+    const bool is_app = !is_exempt_process();
+    errno = saved_errno;
+    return is_app;
 }
 
 // Dynamic prop overrides are only meant for DroidGuard, mirroring PIFork's scope.
@@ -390,7 +440,7 @@ static bool is_app_process() {
 static bool compute_droidguard(bool* resolved) {
     *resolved = false;
 
-    int fd = raw_openat("/proc/self/cmdline", O_RDONLY);
+    int fd = raw_openat("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;
 
     char cmdline[256];
@@ -399,7 +449,7 @@ static bool compute_droidguard(bool* resolved) {
     if (n <= 0) return false;
 
     cmdline[n] = '\0';
-    if (strncmp(cmdline, "zygote", 6) == 0 || strcmp(cmdline, "<pre-initialized>") == 0) {
+    if (name_is_zygote(cmdline) || strncmp(cmdline, "zygote", 6) == 0) {
         return false;
     }
 
@@ -408,19 +458,20 @@ static bool compute_droidguard(bool* resolved) {
 }
 
 static bool is_droidguard_process() {
-    static _Atomic(pid_t) cached_pid = -1;
-    static _Atomic(bool) cached_value = false;
+    static _Atomic(uint64_t) cached_state = 0;
 
     pid_t cur = getpid();
-    if (atomic_load_explicit(&cached_pid, memory_order_acquire) == cur) {
-        return atomic_load_explicit(&cached_value, memory_order_acquire);
+    bool cached_value = false;
+    if (unpack_pid_bool_cache(atomic_load_explicit(&cached_state, memory_order_acquire),
+                              cur, &cached_value)) {
+        return cached_value;
     }
 
     bool resolved = false;
     bool result = compute_droidguard(&resolved);
     if (resolved) {
-        atomic_store_explicit(&cached_value, result, memory_order_release);
-        atomic_store_explicit(&cached_pid, cur, memory_order_release);
+        atomic_store_explicit(&cached_state, pack_pid_bool_cache(cur, result),
+                              memory_order_release);
     }
     return result;
 }
@@ -533,13 +584,11 @@ static bool resolve_fd_path(int fd, char* buf, size_t size) {
 bool custom_rom_hide_should_block(const char* path) {
     if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return false;
     if (path[0] != '/') return false;
-    if (!is_app_process()) return false;
     return is_rom_path(path);
 }
 
 bool custom_rom_hide_should_block_at(int dirfd, const char* path) {
     if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return false;
-    if (!is_app_process()) return false;
 
     int saved_errno = errno;
     bool result = false;
@@ -582,7 +631,6 @@ bool custom_rom_hide_is_symlink(const char* path) {
 
 bool custom_rom_hide_should_filter_dirent(int dirfd, const char* name) {
     if (!name || reinterpret_cast<uintptr_t>(name) < 0x1000000) return false;
-    if (!is_app_process()) return false;
 
     if (name[0] == '.' && (name[1] == '\0'
             || (name[1] == '.' && name[2] == '\0'))) {
@@ -650,9 +698,8 @@ static int create_encoded_memfd(const char* path) {
         if (!meta.sx_ok && errno == EINVAL) {
             meta.sx_ok = raw_statx(AT_FDCWD, path, 0, STATX_ALL, &meta.sx) == 0;
         }
-        if (meta.sb_ok || meta.sx_ok) store_fd_meta(fd, &meta);
+        set_fd_tracking(fd, true, (meta.sb_ok || meta.sx_ok) ? &meta : nullptr);
         errno = saved_errno;
-        register_fd(fd);
     }
     return fd;
 }
@@ -696,14 +743,15 @@ static bool is_tracked_proc_fd_link(const char* path) {
     }
     if (!number || *number < '0' || *number > '9') return false;
     char* end = nullptr;
+    errno = 0;
     long fd = strtol(number, &end, 10);
-    return end && *end == '\0' && fd >= 0 && fd < HIDE_TRACKED_FD_LIMIT &&
+    return errno == 0 && *end == '\0' && fd >= 0 && fd <= INT_MAX &&
            is_tracked_fd(static_cast<int>(fd));
 }
 
 ssize_t custom_rom_hide_readlinkat_post(int dirfd, const char* path, char* buf,
                                         size_t size, ssize_t ret) {
-    if (ret <= 0 || !buf || !is_app_process()) return ret;
+    if (ret <= 0 || !buf) return ret;
     int saved_errno = errno;
     bool has_prefix = ret >= static_cast<ssize_t>(HIDE_MEMFD_LINK_PREFIX_LEN) &&
                       memcmp(buf, HIDE_MEMFD_LINK_PREFIX, HIDE_MEMFD_LINK_PREFIX_LEN) == 0;
@@ -844,7 +892,6 @@ static char* read_file_raw(const char* path, size_t* out_size) {
 }
 
 typedef bool (*LinePredicate)(const char* line, void* ctx);
-typedef bool (*LineWriter)(int mem_fd, char* line, size_t line_len, void* ctx);
 
 static bool raw_write_all(int fd, const void* buffer, size_t size) {
     const char* data = static_cast<const char*>(buffer);
@@ -862,9 +909,36 @@ static bool raw_write_all(int fd, const void* buffer, size_t size) {
     return true;
 }
 
-static bool write_line_raw(int fd, char* line, size_t len, void*) {
-    return raw_write_all(fd, line, len);
-}
+class BufferedOutput {
+  public:
+    explicit BufferedOutput(int fd) : fd_(fd), buffer_(static_cast<char*>(malloc(kCapacity))) {}
+    ~BufferedOutput() { free(buffer_); }
+
+    bool append(const char* data, size_t size) {
+        if (size == 0) return true;
+        if (!buffer_) return raw_write_all(fd_, data, size);
+        if (size > kCapacity - used_ && !flush()) return false;
+        if (size >= kCapacity) return raw_write_all(fd_, data, size);
+        memcpy(buffer_ + used_, data, size);
+        used_ += size;
+        return true;
+    }
+
+    bool flush() {
+        if (used_ == 0) return true;
+        if (!raw_write_all(fd_, buffer_, used_)) return false;
+        used_ = 0;
+        return true;
+    }
+
+  private:
+    static constexpr size_t kCapacity = 64 * 1024;
+    int fd_;
+    char* buffer_;
+    size_t used_ = 0;
+};
+
+using LineWriter = bool (*)(BufferedOutput& output, char* line, size_t line_len, void* ctx);
 
 static int filter_file_with(const char* path, LinePredicate drop, LineWriter writer, void* ctx) {
     size_t file_size = 0;
@@ -877,6 +951,7 @@ static int filter_file_with(const char* path, LinePredicate drop, LineWriter wri
         return -1;
     }
 
+    BufferedOutput output(mem_fd);
     bool ok = true;
     char* pos = content;
     char* end = content + file_size;
@@ -887,7 +962,7 @@ static int filter_file_with(const char* path, LinePredicate drop, LineWriter wri
         char saved = pos[line_len];
         pos[line_len] = '\0';
         if ((!drop || !drop(pos, ctx)) &&
-            !(writer ? writer : write_line_raw)(mem_fd, pos, line_len, ctx)) {
+            !(writer ? writer(output, pos, line_len, ctx) : output.append(pos, line_len))) {
             ok = false;
         }
         pos[line_len] = saved;
@@ -896,7 +971,7 @@ static int filter_file_with(const char* path, LinePredicate drop, LineWriter wri
     }
 
     free(content);
-    if (ok && raw_lseek(mem_fd, 0, SEEK_SET) >= 0) return mem_fd;
+    if (ok && output.flush() && raw_lseek(mem_fd, 0, SEEK_SET) >= 0) return mem_fd;
     int saved_errno = errno;
     custom_rom_hide_unregister_fd(mem_fd);
     raw_close(mem_fd);
@@ -943,7 +1018,7 @@ static const MountDm kMountDm[] = {
     { nullptr,         nullptr },
 };
 
-static bool write_spoofed_mount_line(int mem_fd, char* line, size_t line_len, void*) {
+static bool write_spoofed_mount_line(BufferedOutput& output, char* line, size_t line_len, void*) {
     char* rw_delim = strstr(line, ",rw,");
     if (rw_delim) { rw_delim[1] = 'r'; rw_delim[2] = 'o'; }
     rw_delim = strstr(line, " rw,");
@@ -968,13 +1043,13 @@ static bool write_spoofed_mount_line(int mem_fd, char* line, size_t line_len, vo
             if (dev_start) {
                 char* dev_end = strchr(dev_start, ' ');
                 if (!dev_end) dev_end = dev_start + strlen(dev_start);
-                return raw_write_all(mem_fd, line, dev_start - line) &&
-                       raw_write_all(mem_fd, replacement, strlen(replacement)) &&
-                       raw_write_all(mem_fd, dev_end, line_len - (dev_end - line));
+                return output.append(line, dev_start - line) &&
+                       output.append(replacement, strlen(replacement)) &&
+                       output.append(dev_end, line_len - (dev_end - line));
             }
         }
     }
-    return raw_write_all(mem_fd, line, line_len);
+    return output.append(line, line_len);
 }
 
 static bool drop_proc_line(const char* line, void* ctx) {
@@ -982,7 +1057,6 @@ static bool drop_proc_line(const char* line, void* ctx) {
 }
 
 int custom_rom_hide_filter_proc(const char* path) {
-    if (!is_app_process()) return -1;
     if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return -1;
 
     int saved_errno = errno;
@@ -991,7 +1065,7 @@ int custom_rom_hide_filter_proc(const char* path) {
 
     if (type != PROC_FILTER_CMDLINE) {
         LineWriter writer = (type == PROC_FILTER_MOUNTS || type == PROC_FILTER_MOUNTINFO)
-                ? write_spoofed_mount_line : write_line_raw;
+                ? write_spoofed_mount_line : nullptr;
         int mem_fd = filter_file_with(path, drop_proc_line, writer, &type);
         errno = saved_errno;
         return mem_fd;
@@ -1047,14 +1121,12 @@ static bool drop_sepolicy_line(const char* line, void*) {
 }
 
 int custom_rom_hide_filter_sepolicy(const char* path) {
-    if (!path) return -1;
-    if (!is_app_process()) return -1;
     if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return -1;
 
     int saved_errno = errno;
     if (!is_selinux_policy_path(path)) { errno = saved_errno; return -1; }
 
-    int mem_fd = filter_file_with(path, drop_sepolicy_line, write_line_raw, nullptr);
+    int mem_fd = filter_file_with(path, drop_sepolicy_line, nullptr, nullptr);
     errno = saved_errno;
     return mem_fd;
 }
@@ -1085,7 +1157,6 @@ int custom_rom_hide_filter_vintf(const char* path) {
     (void) path;
     return -1;
 #else
-    if (!is_app_process()) return -1;
     if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return -1;
 
     int saved_errno = errno;
@@ -1114,7 +1185,7 @@ int custom_rom_hide_filter_vintf(const char* path) {
             return true;
         }
         return false;
-    }, write_line_raw, &ctx);
+    }, nullptr, &ctx);
     if (mem_fd >= 0 && ctx.skip_depth != 0) {
         custom_rom_hide_unregister_fd(mem_fd);
         raw_close(mem_fd);
@@ -1150,7 +1221,7 @@ static const PropOverride kSpoofedValueProps[] = {
     {"ro.secure", "1"},
     {"ro.adb.secure", "1"},
     // Boot state as stock reports it on a locked device, matching the cmdline
-    // rewrite in filter_cmdline(). App processes only (see is_app_process()), so
+    // rewrite in filter_cmdline(). App processes only, so
     // system_server's OemLock/PersistentDataBlock checks still see the real state.
     {"ro.boot.verifiedbootstate", "green"},
     {"vendor.boot.verifiedbootstate", "green"},
@@ -1324,7 +1395,6 @@ bool custom_rom_hide_should_spoof_prop(const char* name, char* value) {
     if (!name || !value) return false;
     if (reinterpret_cast<uintptr_t>(name) < 0x1000000) return false;
     if (reinterpret_cast<uintptr_t>(value) < 0x1000000) return false;
-    if (!is_app_process()) return false;
     if (is_hidden_staging_prop(name)) { value[0] = '\0'; return true; }
     for (const char* const* p = kSpoofedEmptyProps; *p; ++p) {
         if (strcmp(name, *p) == 0) { value[0] = '\0'; return true; }
@@ -1337,7 +1407,6 @@ bool custom_rom_hide_should_spoof_prop(const char* name, char* value) {
 
 bool custom_rom_hide_should_hide_prop(const char* name) {
     if (!name || reinterpret_cast<uintptr_t>(name) < 0x1000000) return false;
-    if (!is_app_process()) return false;
     if (is_hidden_staging_prop(name)) return true;
     for (const char* const* p = kSpoofedEmptyProps; *p; ++p) {
         if (strcmp(name, *p) == 0) return true;
@@ -1347,7 +1416,6 @@ bool custom_rom_hide_should_hide_prop(const char* name) {
 
 const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
     if (!name || reinterpret_cast<uintptr_t>(name) < 0x1000000) return nullptr;
-    if (!is_app_process()) return nullptr;
     // is_droidguard_process() is cached per pid once the process name is final.
     const bool droidguard = is_droidguard_process();
     // An exact entry from the PIF config wins over everything below, as in PIFork.
@@ -1388,16 +1456,63 @@ const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
     return nullptr;
 }
 
-bool custom_rom_hide_is_app_process() {
-    return is_app_process();
-}
-
 static const PartitionDevEntry* find_partition_entry(const char* path) {
     if (!path) return nullptr;
     for (const PartitionDevEntry* e = kPartitionDmMap; e->path; ++e) {
         if (strcmp(path, e->path) == 0) return e;
     }
     return nullptr;
+}
+
+static constexpr size_t kPartitionDmCount =
+        sizeof(kPartitionDmMap) / sizeof(kPartitionDmMap[0]) - 1;
+
+struct PartitionRootStat {
+    _Atomic(dev_t) dev;
+    _Atomic(uint64_t) ino;
+    _Atomic(bool) active;
+};
+
+static PartitionRootStat g_partition_roots[kPartitionDmCount];
+static _Atomic(bool) g_partition_roots_initialized = false;
+
+static void ensure_partition_roots_initialized() {
+    if (atomic_load_explicit(&g_partition_roots_initialized, memory_order_acquire)) {
+        return;
+    }
+    for (size_t i = 0; i < kPartitionDmCount; ++i) {
+        struct stat sb;
+        bool active = false;
+        dev_t dev = 0;
+        uint64_t ino = 0;
+        if (raw_fstatat(AT_FDCWD, kPartitionDmMap[i].path, &sb, 0) == 0 &&
+            S_ISDIR(sb.st_mode) && major(sb.st_dev) != DM_MAJOR) {
+            active = true;
+            dev = sb.st_dev;
+            ino = static_cast<uint64_t>(sb.st_ino);
+        }
+        atomic_store_explicit(&g_partition_roots[i].dev, dev, memory_order_relaxed);
+        atomic_store_explicit(&g_partition_roots[i].ino, ino, memory_order_relaxed);
+        atomic_store_explicit(&g_partition_roots[i].active, active, memory_order_relaxed);
+    }
+    atomic_store_explicit(&g_partition_roots_initialized, true, memory_order_release);
+}
+
+static bool may_be_spoofed_partition_root(dev_t dev, uint64_t ino, bool has_ino) {
+    ensure_partition_roots_initialized();
+    for (size_t i = 0; i < kPartitionDmCount; ++i) {
+        if (!atomic_load_explicit(&g_partition_roots[i].active, memory_order_relaxed)) {
+            continue;
+        }
+        if (atomic_load_explicit(&g_partition_roots[i].dev, memory_order_relaxed) != dev) {
+            continue;
+        }
+        if (!has_ino ||
+            atomic_load_explicit(&g_partition_roots[i].ino, memory_order_relaxed) == ino) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void normalize_statfs_type(struct statfs* sf) {
@@ -1407,13 +1522,13 @@ static void normalize_statfs_type(struct statfs* sf) {
 }
 
 void custom_rom_hide_spoof_stat(const char* path, struct stat* sb) {
-    if (!is_app_process() || !path || !sb) return;
+    if (!path || !sb) return;
     const PartitionDevEntry* e = find_partition_entry(path);
     if (e && major(sb->st_dev) != DM_MAJOR) sb->st_dev = makedev(DM_MAJOR, e->dm_minor);
 }
 
 void custom_rom_hide_spoof_statx(const char* path, struct statx* sx) {
-    if (!is_app_process() || !path || !sx) return;
+    if (!path || !sx) return;
     const PartitionDevEntry* e = find_partition_entry(path);
     if (e && sx->stx_dev_major != DM_MAJOR) {
         sx->stx_dev_major = DM_MAJOR;
@@ -1422,13 +1537,12 @@ void custom_rom_hide_spoof_statx(const char* path, struct statx* sx) {
 }
 
 void custom_rom_hide_spoof_statfs(const char* path, struct statfs* sf) {
-    if (!is_app_process() || !path || !sf) return;
+    if (!path || !sf) return;
     normalize_statfs_type(sf);
 }
 
 void custom_rom_hide_spoof_fd_stat(int fd, struct stat* sb) {
     if (fd < 0 || !sb) return;
-    if (!is_app_process()) return;
 
     int saved_errno = errno;
     if (is_tracked_fd(fd)) {
@@ -1443,7 +1557,8 @@ void custom_rom_hide_spoof_fd_stat(int fd, struct stat* sb) {
             if (raw_fstatat(AT_FDCWD, real_path, &real_sb, 0) == 0) *sb = real_sb;
             else if (load_fd_meta(fd, &meta) && meta.sb_ok) *sb = meta.sb;
         }
-    } else if (S_ISDIR(sb->st_mode) && major(sb->st_dev) != DM_MAJOR) {
+    } else if (S_ISDIR(sb->st_mode) && major(sb->st_dev) != DM_MAJOR &&
+               may_be_spoofed_partition_root(sb->st_dev, static_cast<uint64_t>(sb->st_ino), true)) {
         char fd_path[512];
         if (resolve_fd_path(fd, fd_path, sizeof(fd_path))) {
             custom_rom_hide_spoof_stat(fd_path, sb);
@@ -1454,7 +1569,6 @@ void custom_rom_hide_spoof_fd_stat(int fd, struct stat* sb) {
 
 void custom_rom_hide_spoof_fd_statx(int fd, unsigned mask, struct statx* sx) {
     if (fd < 0 || !sx) return;
-    if (!is_app_process()) return;
 
     int saved_errno = errno;
     if (is_tracked_fd(fd)) {
@@ -1468,7 +1582,9 @@ void custom_rom_hide_spoof_fd_statx(int fd, unsigned mask, struct statx* sx) {
             else if (load_fd_meta(fd, &meta) && meta.sx_ok) *sx = meta.sx;
         }
     } else if ((sx->stx_mode == 0 || S_ISDIR(sx->stx_mode)) &&
-               sx->stx_dev_major != DM_MAJOR) {
+               sx->stx_dev_major != DM_MAJOR &&
+               may_be_spoofed_partition_root(makedev(sx->stx_dev_major, sx->stx_dev_minor),
+                                             sx->stx_ino, (sx->stx_mask & STATX_INO) != 0)) {
         char fd_path[512];
         if (resolve_fd_path(fd, fd_path, sizeof(fd_path))) {
             custom_rom_hide_spoof_statx(fd_path, sx);
@@ -1479,7 +1595,6 @@ void custom_rom_hide_spoof_fd_statx(int fd, unsigned mask, struct statx* sx) {
 
 void custom_rom_hide_spoof_fd_statfs(int fd, struct statfs* sf) {
     if (fd < 0 || !sf) return;
-    if (!is_app_process()) return;
 
     int saved_errno = errno;
     if (is_tracked_fd(fd)) {

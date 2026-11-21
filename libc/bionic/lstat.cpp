@@ -41,7 +41,8 @@ extern "C" int __fstatat64(int, const char*, struct stat*, int);
 #endif
 
 int lstat(const char* path, struct stat* sb) {
-  if (custom_rom_hide_should_block(path)) {
+  bool is_app = custom_rom_hide_is_app_process();
+  if (is_app && custom_rom_hide_should_block(path)) {
     errno = ENOENT;
     return -1;
   }
@@ -50,7 +51,7 @@ int lstat(const char* path, struct stat* sb) {
 #else
   int res = __fstatat64(AT_FDCWD, path, sb, AT_SYMLINK_NOFOLLOW);
 #endif
-  if (res == 0) {
+  if (res == 0 && is_app) {
     custom_rom_hide_spoof_stat(path, sb);
   }
   return res;
