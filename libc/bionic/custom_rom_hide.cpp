@@ -193,11 +193,21 @@ struct FdDirectory {
 
 static _Atomic(FdDirectory*) g_fd_directories[128];
 static Lock g_fd_meta_lock;
+static Lock g_pif_custom_lock;
 static pthread_once_t g_fd_meta_atfork_once = PTHREAD_ONCE_INIT;
 
-static void prepare_fd_meta_fork() { g_fd_meta_lock.lock(); }
-static void parent_fd_meta_fork() { g_fd_meta_lock.unlock(); }
-static void child_fd_meta_fork() { g_fd_meta_lock.init(false); }
+static void prepare_fd_meta_fork() {
+    g_fd_meta_lock.lock();
+    g_pif_custom_lock.lock();
+}
+static void parent_fd_meta_fork() {
+    g_pif_custom_lock.unlock();
+    g_fd_meta_lock.unlock();
+}
+static void child_fd_meta_fork() {
+    g_fd_meta_lock.init(false);
+    g_pif_custom_lock.init(false);
+}
 
 static void register_fd_meta_atfork() {
     pthread_atfork(prepare_fd_meta_fork, parent_fd_meta_fork, child_fd_meta_fork);
@@ -256,6 +266,7 @@ static void set_fd_tracking(int fd, bool tracked, const FdMeta* meta = nullptr) 
     uint64_t bit = 1ULL << (index % kFdWordBits);
     auto* word = &page->tracked[index / kFdWordBits];
 
+    pthread_once(&g_fd_meta_atfork_once, register_fd_meta_atfork);
     g_fd_meta_lock.lock();
     FdMeta* old = page->metadata[index];
     page->metadata[index] = copy;
@@ -273,6 +284,7 @@ static bool load_fd_meta(int fd, FdMeta* out) {
     FdPage* page = get_fd_page(fd);
     if (!page) return false;
     unsigned index = static_cast<unsigned>(fd) & kFdPageMask;
+    pthread_once(&g_fd_meta_atfork_once, register_fd_meta_atfork);
     g_fd_meta_lock.lock();
     const FdMeta* meta = page->metadata[index];
     if (meta) *out = *meta;
@@ -1343,52 +1355,109 @@ static bool is_hidden_staging_prop(const char* name) {
 #define PIF_CUSTOM_SLOT_PREFIX "persist.sys.pif.x."
 #define PIF_CUSTOM_SLOT_MAX 32
 
+struct PifCustomSlot {
+    char key[PROP_VALUE_MAX];
+    char value[PROP_VALUE_MAX];
+    size_t key_len;
+    bool is_wildcard;
+};
+static _Atomic(uint32_t) g_pif_custom_serial = 0;
+static _Atomic(int) g_pif_custom_count = -1; // -1 = uninitialized
+static PifCustomSlot g_pif_custom_slots[PIF_CUSTOM_SLOT_MAX];
+
 static const char* find_custom_prop_override(const char* name, char* buffer, bool wildcard) {
     if (strncmp(name, PIF_STAGING_PROP_PREFIX, sizeof(PIF_STAGING_PROP_PREFIX) - 1) == 0) {
         return nullptr;
     }
-    // This code is also linked into the loader, so stick to plain string operations.
-    char raw[PROP_VALUE_MAX];
-    if (__system_property_get(PIF_CUSTOM_COUNT_PROP, raw) <= 0) return nullptr;
-    int count = 0;
-    for (const char* c = raw; *c >= '0' && *c <= '9' && count < 1000; ++c) {
-        count = count * 10 + (*c - '0');
+
+    const uint32_t area_serial = __system_property_area_serial();
+    if (atomic_load_explicit(&g_pif_custom_count, memory_order_acquire) == 0 &&
+        atomic_load_explicit(&g_pif_custom_serial, memory_order_acquire) == area_serial &&
+        atomic_load_explicit(&g_pif_custom_count, memory_order_acquire) == 0) {
+        return nullptr;
     }
-    if (count > PIF_CUSTOM_SLOT_MAX) count = PIF_CUSTOM_SLOT_MAX;
 
-    const size_t name_len = strlen(name);
-    char slot[sizeof(PIF_CUSTOM_SLOT_PREFIX) + 3];
-    memcpy(slot, PIF_CUSTOM_SLOT_PREFIX, sizeof(PIF_CUSTOM_SLOT_PREFIX) - 1);
-    for (int i = 0; i < count; ++i) {
-        char* p = slot + sizeof(PIF_CUSTOM_SLOT_PREFIX) - 1;
-        if (i >= 10) *p++ = static_cast<char>('0' + i / 10);
-        *p++ = static_cast<char>('0' + i % 10);
-        *p = '\0';
+    pthread_once(&g_fd_meta_atfork_once, register_fd_meta_atfork);
+    g_pif_custom_lock.lock();
 
-        char entry[PROP_VALUE_MAX];
-        if (__system_property_get(slot, entry) <= 0) continue;
-        char* eq = entry;
-        while (*eq && *eq != '=') ++eq;
-        if (*eq != '=') continue;
-        *eq = '\0';
-        const char* key = entry;
-        const char* value = eq + 1;
+    int count = atomic_load_explicit(&g_pif_custom_count, memory_order_relaxed);
+    uint32_t cached_serial = atomic_load_explicit(&g_pif_custom_serial, memory_order_relaxed);
+    if (count < 0 || cached_serial != area_serial) {
+        const uint32_t load_serial = __system_property_area_serial();
+        atomic_store_explicit(&g_pif_custom_count, -1, memory_order_relaxed);
+        atomic_store_explicit(&g_pif_custom_serial, load_serial, memory_order_release);
 
-        bool match;
-        if (key[0] == '*') {
-            if (!wildcard) continue;
-            const size_t suffix_len = strlen(key + 1);
-            match = suffix_len > 0 && name_len >= suffix_len &&
-                    strcmp(name + name_len - suffix_len, key + 1) == 0;
-        } else {
-            if (wildcard) continue;
-            match = strcmp(key, name) == 0;
+        int raw_count = 0;
+        // This code is also linked into the loader, so stick to plain string operations.
+        char raw[PROP_VALUE_MAX];
+        if (__system_property_get(PIF_CUSTOM_COUNT_PROP, raw) > 0) {
+            for (const char* c = raw; *c >= '0' && *c <= '9' && raw_count < 1000; ++c) {
+                raw_count = raw_count * 10 + (*c - '0');
+            }
+            if (raw_count > PIF_CUSTOM_SLOT_MAX) raw_count = PIF_CUSTOM_SLOT_MAX;
         }
-        if (!match) continue;
-        strcpy(buffer, value);
-        return buffer;
+
+        int valid_count = 0;
+        char slot[sizeof(PIF_CUSTOM_SLOT_PREFIX) + 3];
+        memcpy(slot, PIF_CUSTOM_SLOT_PREFIX, sizeof(PIF_CUSTOM_SLOT_PREFIX) - 1);
+        for (int i = 0; i < raw_count; ++i) {
+            char* p = slot + sizeof(PIF_CUSTOM_SLOT_PREFIX) - 1;
+            if (i >= 10) *p++ = static_cast<char>('0' + i / 10);
+            *p++ = static_cast<char>('0' + i % 10);
+            *p = '\0';
+
+            char entry[PROP_VALUE_MAX];
+            if (__system_property_get(slot, entry) <= 0) continue;
+            char* eq = entry;
+            while (*eq && *eq != '=') ++eq;
+            if (*eq != '=') continue;
+            *eq = '\0';
+            const char* key = entry;
+            const char* value = eq + 1;
+
+            const bool is_wildcard = (key[0] == '*');
+            const char* match_key = is_wildcard ? (key + 1) : key;
+            const size_t key_len = strlen(match_key);
+            if (is_wildcard && key_len == 0) continue;
+
+            PifCustomSlot& dst = g_pif_custom_slots[valid_count];
+            dst.is_wildcard = is_wildcard;
+            dst.key_len = key_len;
+            memcpy(dst.key, match_key, key_len + 1);
+            const size_t val_len = strlen(value);
+            memcpy(dst.value, value, val_len + 1);
+            ++valid_count;
+        }
+
+        count = valid_count;
+        atomic_store_explicit(&g_pif_custom_count, count, memory_order_release);
     }
-    return nullptr;
+
+    const char* result = nullptr;
+    const size_t name_len = strlen(name);
+    for (int i = 0; i < count; ++i) {
+        const PifCustomSlot& entry = g_pif_custom_slots[i];
+        if (entry.is_wildcard != wildcard) continue;
+        bool match;
+        if (entry.is_wildcard) {
+            match = entry.key_len > 0 && name_len >= entry.key_len &&
+                    memcmp(name + name_len - entry.key_len, entry.key, entry.key_len) == 0;
+        } else {
+            match = (name_len == entry.key_len) &&
+                    (memcmp(entry.key, name, name_len) == 0);
+        }
+        if (match) {
+            size_t val_len = strlen(entry.value);
+            if (val_len >= PROP_VALUE_MAX) val_len = PROP_VALUE_MAX - 1;
+            memcpy(buffer, entry.value, val_len);
+            buffer[val_len] = '\0';
+            result = buffer;
+            break;
+        }
+    }
+
+    g_pif_custom_lock.unlock();
+    return result;
 }
 
 bool custom_rom_hide_should_spoof_prop(const char* name, char* value) {
@@ -1422,12 +1491,14 @@ const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
     if (droidguard) {
         if (const char* v = find_custom_prop_override(name, buffer, false)) return v;
     }
-    for (const PropOverride* o = kSpoofedValueProps; o->name; ++o) {
-        if (strcmp(name, o->name) == 0) return o->value;
+    if (name[0] == 'r' || name[0] == 'v') {
+        for (const PropOverride* o = kSpoofedValueProps; o->name; ++o) {
+            if (strcmp(name, o->name) == 0) return o->value;
+        }
     }
+    if (!droidguard) return nullptr;
     for (const DynamicPropOverride* o = kDynamicProductProps; o->name; ++o) {
         if (strcmp(name, o->name) == 0) {
-            if (!droidguard) return nullptr;
             // This code is also linked into the loader, which cannot contain ELF TLS.
             // The caller owns a PROP_VALUE_MAX buffer for the duration of the read.
             int len = __system_property_get(o->staging_name, buffer);
@@ -1436,24 +1507,19 @@ const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
         }
     }
     if (const char* staging = find_product_partition_staging(name)) {
-        if (!droidguard) return nullptr;
         int len = __system_property_get(staging, buffer);
         if (len > 0) return buffer;
         return nullptr;
     }
     if (const DynamicSuffixOverride* o = find_dynamic_suffix_override(name)) {
-        if (!droidguard) return nullptr;
         int len = __system_property_get(o->staging_name, buffer);
         if (len > 0) return buffer;
     }
     for (const PropOverride* o = kDroidGuardValueProps; o->name; ++o) {
-        if (strcmp(name, o->name) == 0) {
-            return droidguard ? o->value : nullptr;
-        }
+        if (strcmp(name, o->name) == 0) return o->value;
     }
     // Wildcard entries from the PIF config apply last, after the fixed tables.
-    if (droidguard) return find_custom_prop_override(name, buffer, true);
-    return nullptr;
+    return find_custom_prop_override(name, buffer, true);
 }
 
 static const PartitionDevEntry* find_partition_entry(const char* path) {
