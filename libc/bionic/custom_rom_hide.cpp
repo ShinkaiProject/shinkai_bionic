@@ -29,6 +29,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
@@ -172,40 +173,41 @@ static constexpr unsigned kStatxCaptureMask = STATX_ALL | STATX_DIOALIGN |
 
 // Sparse pages cover the full nonnegative int range without allocating a
 // descriptor-sized table in every process. Pages stay alive once published so
-// ordinary close and fstat can test an untracked descriptor without locking.
-static constexpr unsigned kFdPageBits = 8;
+// ordinary close, fstat, and signal handlers stay lock-free and allocation-free.
+static constexpr unsigned kFdPageBits = 6;
 static constexpr unsigned kFdPageSize = 1u << kFdPageBits;
 static constexpr unsigned kFdPageMask = kFdPageSize - 1;
-static constexpr unsigned kFdWordBits = 64;
+static constexpr unsigned kFdTableBits = 8;
+static constexpr unsigned kFdTableSize = 1u << kFdTableBits;
+static constexpr unsigned kFdTableMask = kFdTableSize - 1;
+static constexpr unsigned kFdDirEntries = 512;
 
 struct FdPage {
-    _Atomic(uint64_t) tracked[kFdPageSize / kFdWordBits];
-    FdMeta* metadata[kFdPageSize];  // Guarded by g_fd_meta_lock.
+    _Atomic(uint64_t) tracked;
+    FdMeta metadata[kFdPageSize];
+    _Atomic(uint32_t) meta_seq[kFdPageSize];
+    _Atomic(bool) meta_valid[kFdPageSize];
 };
 
 struct FdPageTable {
-    _Atomic(FdPage*) pages[kFdPageSize];
+    _Atomic(FdPage*) pages[kFdTableSize];
 };
 
 struct FdDirectory {
-    _Atomic(FdPageTable*) tables[kFdPageSize];
+    _Atomic(FdPageTable*) tables[kFdTableSize];
 };
 
-static _Atomic(FdDirectory*) g_fd_directories[128];
-static Lock g_fd_meta_lock;
+static _Atomic(FdDirectory*) g_fd_directories[kFdDirEntries];
 static Lock g_pif_custom_lock;
 static pthread_once_t g_fd_meta_atfork_once = PTHREAD_ONCE_INIT;
 
 static void prepare_fd_meta_fork() {
-    g_fd_meta_lock.lock();
     g_pif_custom_lock.lock();
 }
 static void parent_fd_meta_fork() {
     g_pif_custom_lock.unlock();
-    g_fd_meta_lock.unlock();
 }
 static void child_fd_meta_fork() {
-    g_fd_meta_lock.init(false);
     g_pif_custom_lock.init(false);
 }
 
@@ -218,34 +220,36 @@ static T* get_fd_table(_Atomic(T*)* slot, bool create) {
     T* table = atomic_load_explicit(slot, memory_order_acquire);
     if (table || !create) return table;
 
-    T* fresh = static_cast<T*>(calloc(1, sizeof(T)));
-    if (!fresh) return nullptr;
+    void* mem = mmap(nullptr, sizeof(T), PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) return nullptr;
+    T* fresh = static_cast<T*>(mem);
     if (atomic_compare_exchange_strong_explicit(slot, &table, fresh, memory_order_acq_rel,
                                                 memory_order_acquire)) {
         return fresh;
     }
-    free(fresh);
+    munmap(fresh, sizeof(T));
     return table;
 }
 
 static FdPage* get_fd_page(int fd, bool create = false) {
     if (fd < 0) return nullptr;
     unsigned index = static_cast<unsigned>(fd);
-    auto* directory = get_fd_table<FdDirectory>(&g_fd_directories[index >> (kFdPageBits * 3)], create);
+    auto* directory = get_fd_table<FdDirectory>(
+            &g_fd_directories[index >> (kFdPageBits + kFdTableBits * 2)], create);
     if (!directory) return nullptr;
-    auto* table = get_fd_table<FdPageTable>(&directory->tables[(index >> (kFdPageBits * 2)) & kFdPageMask],
-                               create);
+    auto* table = get_fd_table<FdPageTable>(
+            &directory->tables[(index >> (kFdPageBits + kFdTableBits)) & kFdTableMask], create);
     if (!table) return nullptr;
-    return get_fd_table<FdPage>(&table->pages[(index >> kFdPageBits) & kFdPageMask], create);
+    return get_fd_table<FdPage>(&table->pages[(index >> kFdPageBits) & kFdTableMask], create);
 }
 
 static bool is_tracked_fd(int fd) {
     FdPage* page = get_fd_page(fd);
     if (!page) return false;
     unsigned index = static_cast<unsigned>(fd) & kFdPageMask;
-    uint64_t bit = 1ULL << (index % kFdWordBits);
-    return (atomic_load_explicit(&page->tracked[index / kFdWordBits], memory_order_acquire)
-            & bit) != 0;
+    uint64_t bit = 1ULL << index;
+    return (atomic_load_explicit(&page->tracked, memory_order_acquire) & bit) != 0;
 }
 
 static void set_fd_tracking(int fd, bool tracked, const FdMeta* meta = nullptr) {
@@ -257,26 +261,30 @@ static void set_fd_tracking(int fd, bool tracked, const FdMeta* meta = nullptr) 
         return;
     }
 
-    FdMeta* copy = nullptr;
-    if (meta) {
-        copy = static_cast<FdMeta*>(malloc(sizeof(FdMeta)));
-        if (copy) *copy = *meta;
-    }
     unsigned index = static_cast<unsigned>(fd) & kFdPageMask;
-    uint64_t bit = 1ULL << (index % kFdWordBits);
-    auto* word = &page->tracked[index / kFdWordBits];
+    uint64_t bit = 1ULL << index;
 
-    pthread_once(&g_fd_meta_atfork_once, register_fd_meta_atfork);
-    g_fd_meta_lock.lock();
-    FdMeta* old = page->metadata[index];
-    page->metadata[index] = copy;
-    if (tracked) {
-        atomic_fetch_or_explicit(word, bit, memory_order_release);
-    } else {
-        atomic_fetch_and_explicit(word, ~bit, memory_order_release);
+    if (!tracked) {
+        atomic_store_explicit(&page->meta_valid[index], false, memory_order_release);
+        atomic_fetch_and_explicit(&page->tracked, ~bit, memory_order_release);
+        errno = saved_errno;
+        return;
     }
-    g_fd_meta_lock.unlock();
-    free(old);
+
+    uint32_t seq = atomic_load_explicit(&page->meta_seq[index], memory_order_relaxed);
+    if ((seq & 1u) == 0 &&
+        atomic_compare_exchange_strong_explicit(&page->meta_seq[index], &seq, seq + 1u,
+                                                memory_order_acq_rel, memory_order_relaxed)) {
+        atomic_thread_fence(memory_order_release);
+        if (meta) {
+            page->metadata[index] = *meta;
+            atomic_store_explicit(&page->meta_valid[index], true, memory_order_relaxed);
+        } else {
+            atomic_store_explicit(&page->meta_valid[index], false, memory_order_relaxed);
+        }
+        atomic_store_explicit(&page->meta_seq[index], seq + 2u, memory_order_release);
+    }
+    atomic_fetch_or_explicit(&page->tracked, bit, memory_order_release);
     errno = saved_errno;
 }
 
@@ -284,12 +292,20 @@ static bool load_fd_meta(int fd, FdMeta* out) {
     FdPage* page = get_fd_page(fd);
     if (!page) return false;
     unsigned index = static_cast<unsigned>(fd) & kFdPageMask;
-    pthread_once(&g_fd_meta_atfork_once, register_fd_meta_atfork);
-    g_fd_meta_lock.lock();
-    const FdMeta* meta = page->metadata[index];
-    if (meta) *out = *meta;
-    g_fd_meta_lock.unlock();
-    return meta != nullptr;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        uint32_t s1 = atomic_load_explicit(&page->meta_seq[index], memory_order_acquire);
+        if ((s1 & 1u) != 0) continue;
+        bool valid = atomic_load_explicit(&page->meta_valid[index], memory_order_relaxed);
+        FdMeta copy = {};
+        if (valid) copy = page->metadata[index];
+        atomic_thread_fence(memory_order_acquire);
+        uint32_t s2 = atomic_load_explicit(&page->meta_seq[index], memory_order_relaxed);
+        if (s1 == s2) {
+            if (valid) *out = copy;
+            return valid;
+        }
+    }
+    return false;
 }
 
 void custom_rom_hide_unregister_fd(int fd) {
@@ -701,7 +717,6 @@ static int create_encoded_memfd(const char* path) {
     }
     int fd = raw_memfd_create(memfd_name, 0);
     if (fd >= 0) {
-        pthread_once(&g_fd_meta_atfork_once, register_fd_meta_atfork);
         int saved_errno = errno;
         FdMeta meta = {};
         meta.sb_ok = raw_fstatat(AT_FDCWD, path, &meta.sb, 0) == 0;
@@ -1031,34 +1046,34 @@ static const MountDm kMountDm[] = {
 };
 
 static bool write_spoofed_mount_line(BufferedOutput& output, char* line, size_t line_len, void*) {
-    char* rw_delim = strstr(line, ",rw,");
-    if (rw_delim) { rw_delim[1] = 'r'; rw_delim[2] = 'o'; }
-    rw_delim = strstr(line, " rw,");
-    if (rw_delim) { rw_delim[1] = 'r'; rw_delim[2] = 'o'; }
-    rw_delim = strstr(line, ",rw ");
-    if (rw_delim) { rw_delim[1] = 'r'; rw_delim[2] = 'o'; }
+    const char* replacement = nullptr;
+    for (const MountDm* m = kMountDm; m->mnt; ++m) {
+        if (strstr(line, m->mnt)) { replacement = m->dev; break; }
+    }
+    if (!replacement &&
+        (strstr(line, " / / ") || strstr(line, " / ext4") ||
+         strstr(line, " / erofs") || strstr(line, " / f2fs"))) {
+        replacement = "/dev/block/dm-0";
+    }
 
-    if (!strstr(line, "/dev/block/loop")) {
-        const char* replacement = nullptr;
-        for (const MountDm* m = kMountDm; m->mnt; ++m) {
-            if (strstr(line, m->mnt)) { replacement = m->dev; break; }
-        }
-        if (!replacement &&
-            (strstr(line, " / / ") || strstr(line, " / ext4") ||
-             strstr(line, " / erofs") || strstr(line, " / f2fs")))
-            replacement = "/dev/block/dm-0";
+    const bool is_ro_system_mount = replacement != nullptr && !strstr(line, "/dev/block/loop");
+    if (is_ro_system_mount) {
+        char* rw_delim = strstr(line, ",rw,");
+        if (rw_delim) { rw_delim[1] = 'r'; rw_delim[2] = 'o'; }
+        rw_delim = strstr(line, " rw,");
+        if (rw_delim) { rw_delim[1] = 'r'; rw_delim[2] = 'o'; }
+        rw_delim = strstr(line, ",rw ");
+        if (rw_delim) { rw_delim[1] = 'r'; rw_delim[2] = 'o'; }
 
-        if (replacement) {
-            char* dev_start = strstr(line, "/dev/block/");
-            if (!dev_start) dev_start = strstr(line, "/dev/root");
+        char* dev_start = strstr(line, "/dev/block/");
+        if (!dev_start) dev_start = strstr(line, "/dev/root");
 
-            if (dev_start) {
-                char* dev_end = strchr(dev_start, ' ');
-                if (!dev_end) dev_end = dev_start + strlen(dev_start);
-                return output.append(line, dev_start - line) &&
-                       output.append(replacement, strlen(replacement)) &&
-                       output.append(dev_end, line_len - (dev_end - line));
-            }
+        if (dev_start) {
+            char* dev_end = strchr(dev_start, ' ');
+            if (!dev_end) dev_end = dev_start + strlen(dev_start);
+            return output.append(line, dev_start - line) &&
+                   output.append(replacement, strlen(replacement)) &&
+                   output.append(dev_end, line_len - (dev_end - line));
         }
     }
     return output.append(line, line_len);
@@ -1164,6 +1179,31 @@ static const char* const kVintfFilterKeywords[] = {
 };
 #endif
 
+static bool contains_keyword_n(const char* buf, size_t len, const char* const* keywords) {
+    for (const char* const* kw = keywords; *kw; ++kw) {
+        size_t kw_len = strlen(*kw);
+        if (kw_len > 0 && kw_len <= len && memmem(buf, len, *kw, kw_len) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool write_vintf_non_hal_span(BufferedOutput& output, const char* span, size_t len) {
+    const char* pos = span;
+    const char* end = span + len;
+    while (pos < end) {
+        const char* eol = static_cast<const char*>(memchr(pos, '\n', end - pos));
+        size_t line_len = eol ? static_cast<size_t>(eol - pos + 1)
+                              : static_cast<size_t>(end - pos);
+        if (!contains_keyword_n(pos, line_len, kVintfFilterKeywords)) {
+            if (!output.append(pos, line_len)) return false;
+        }
+        pos += line_len;
+    }
+    return true;
+}
+
 int custom_rom_hide_filter_vintf(const char* path) {
 #if !CUSTOM_ROM_HIDE_FILTER_VINTF
     (void) path;
@@ -1178,34 +1218,92 @@ int custom_rom_hide_filter_vintf(const char* path) {
     }
     if (!match) { errno = saved_errno; return -1; }
 
-    struct VintfCtx {
-        int skip_depth;
-    } ctx = {};
-    int mem_fd = filter_file_with(path, [](const char* line, void* raw_ctx) {
-        VintfCtx* ctx = static_cast<VintfCtx*>(raw_ctx);
-        bool keyword_hit = line_contains_any(line, kVintfFilterKeywords);
-        bool opens_block = strstr(line, "<hal") != nullptr || strstr(line, "<interface") != nullptr;
-        bool closes_block = strstr(line, "</hal>") != nullptr || strstr(line, "</interface>") != nullptr;
+    size_t file_size = 0;
+    char* content = read_file_raw(path, &file_size);
+    if (!content) { errno = saved_errno; return -1; }
 
-        if (ctx->skip_depth > 0) {
-            if (opens_block) ctx->skip_depth++;
-            if (closes_block) ctx->skip_depth--;
-            return true;
-        }
-        if (keyword_hit) {
-            if (opens_block && !closes_block) ctx->skip_depth = 1;
-            return true;
-        }
-        return false;
-    }, nullptr, &ctx);
-    if (mem_fd >= 0 && ctx.skip_depth != 0) {
-        custom_rom_hide_unregister_fd(mem_fd);
-        raw_close(mem_fd);
+    int mem_fd = create_encoded_memfd(path);
+    if (mem_fd < 0) {
+        free(content);
         errno = saved_errno;
         return -1;
     }
+
+    BufferedOutput output(mem_fd);
+    bool ok = true;
+    const char* span_start = content;
+    const char* scan = content;
+    const char* end = content + file_size;
+
+    while (scan < end) {
+        const char* tag_pos = static_cast<const char*>(memmem(scan, end - scan, "<hal", 4));
+        if (!tag_pos) break;
+        if (tag_pos + 4 >= end) {
+            ok = false;
+            break;
+        }
+        char after = tag_pos[4];
+        if (after != ' ' && after != '\t' && after != '\r' && after != '\n' &&
+            after != '>' && after != '/') {
+            scan = tag_pos + 4;
+            continue;
+        }
+
+        if (!write_vintf_non_hal_span(output, span_start, static_cast<size_t>(tag_pos - span_start))) {
+            ok = false;
+            break;
+        }
+
+        const char* open_end = static_cast<const char*>(
+                memchr(tag_pos + 4, '>', end - (tag_pos + 4)));
+        if (!open_end) {
+            ok = false;
+            break;
+        }
+
+        const char* block_end = nullptr;
+        if (open_end[-1] == '/') {
+            block_end = open_end + 1;
+        } else {
+            const char* close_tag = static_cast<const char*>(
+                    memmem(open_end + 1, end - (open_end + 1), "</hal>", 6));
+            if (!close_tag) {
+                ok = false;
+                break;
+            }
+            block_end = close_tag + 6;
+        }
+
+        if (block_end + 1 < end && block_end[0] == '\r' && block_end[1] == '\n') {
+            block_end += 2;
+        } else if (block_end < end && block_end[0] == '\n') {
+            block_end += 1;
+        }
+
+        size_t block_len = static_cast<size_t>(block_end - tag_pos);
+        if (!contains_keyword_n(tag_pos, block_len, kVintfFilterKeywords)) {
+            if (!output.append(tag_pos, block_len)) {
+                ok = false;
+                break;
+            }
+        }
+        span_start = block_end;
+        scan = block_end;
+    }
+
+    if (ok && span_start < end) {
+        ok = write_vintf_non_hal_span(output, span_start, static_cast<size_t>(end - span_start));
+    }
+
+    free(content);
+    if (ok && output.flush() && raw_lseek(mem_fd, 0, SEEK_SET) >= 0) {
+        errno = saved_errno;
+        return mem_fd;
+    }
+    custom_rom_hide_unregister_fd(mem_fd);
+    raw_close(mem_fd);
     errno = saved_errno;
-    return mem_fd;
+    return -1;
 #endif
 }
 
@@ -1485,6 +1583,9 @@ bool custom_rom_hide_should_hide_prop(const char* name) {
 
 const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
     if (!name || reinterpret_cast<uintptr_t>(name) < 0x1000000) return nullptr;
+    if (strncmp(name, PIF_STAGING_PROP_PREFIX, sizeof(PIF_STAGING_PROP_PREFIX) - 1) == 0) {
+        return nullptr;
+    }
     // is_droidguard_process() is cached per pid once the process name is final.
     const bool droidguard = is_droidguard_process();
     // An exact entry from the PIF config wins over everything below, as in PIFork.

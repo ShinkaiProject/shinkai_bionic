@@ -79,9 +79,17 @@ __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 int __system_property_read(const prop_info* pi, char* name, char* value) {
   int len = system_properties.Read(pi, name, value);
   const char* prop_name = name ? name : (pi ? pi->name : nullptr);
-  if (prop_name && custom_rom_hide_is_app_process() &&
-      custom_rom_hide_should_spoof_prop(prop_name, value)) {
-    return strlen(value);
+  if (prop_name && value && custom_rom_hide_is_app_process()) {
+    if (custom_rom_hide_should_hide_prop(prop_name)) {
+      value[0] = '\0';
+      return 0;
+    }
+    char override_buffer[PROP_VALUE_MAX];
+    const char* override_val = custom_rom_hide_get_prop_override(prop_name, override_buffer);
+    if (override_val) {
+      strlcpy(value, override_val, PROP_VALUE_MAX);
+      return strlen(value);
+    }
   }
   return len;
 }
@@ -135,8 +143,17 @@ void __system_property_read_callback(const prop_info* pi,
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 int __system_property_get(const char* name, char* value) {
   int len = system_properties.Get(name, value);
-  if (custom_rom_hide_is_app_process() && custom_rom_hide_should_spoof_prop(name, value)) {
-    return strlen(value);
+  if (name && value && custom_rom_hide_is_app_process()) {
+    if (custom_rom_hide_should_hide_prop(name)) {
+      value[0] = '\0';
+      return 0;
+    }
+    char override_buffer[PROP_VALUE_MAX];
+    const char* override_val = custom_rom_hide_get_prop_override(name, override_buffer);
+    if (override_val) {
+      strlcpy(value, override_val, PROP_VALUE_MAX);
+      return strlen(value);
+    }
   }
   return len;
 }
